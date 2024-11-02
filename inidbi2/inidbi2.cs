@@ -2,25 +2,37 @@
 using System.IO;
 using System.Text;
 using System.Runtime.InteropServices;
-using RGiesecke.DllExport;
+using System.Runtime.CompilerServices;
+using IniParser;
+using IniParser.Model;
 using System.Reflection;
+using System.Formats.Asn1;
 
 namespace inidbi2
 {
     public class inidbi2
     {
 #if WIN64
-        [DllExport("RVExtension", CallingConvention = CallingConvention.Winapi)]
+        [UnmanagedCallersOnly(EntryPoint = "RVExtension", CallConvs = [typeof(CallConvStdcall)])]
 #else
-        [DllExport("_RVExtension@12", CallingConvention = CallingConvention.Winapi)]
+        // Untested
+        [UnmanagedCallersOnly(EntryPoint = "_RVExtension@12", CallConvs = [typeof(CallConvStdcall)])]
 #endif
-        public static void RVExtension(StringBuilder output, int outputSize, [MarshalAs(UnmanagedType.LPStr)] string function)
+        public unsafe static void RVExtension(byte* _output, uint outputSize, char* _function)
         {
+            string function = Marshal.PtrToStringAnsi((IntPtr)_function);
+
             if (_instance == null)
                 _instance = new inidbi2();
 
             string ret = _instance.Invoke(function);
-            output.Append(ret);
+
+            var len = Math.Min(ret.Length, outputSize);
+            var bytes = Encoding.ASCII.GetBytes(ret);
+            for (int i = 0; i < len; i++) {
+                _output[i] = bytes[i];
+            }
+            _output[len] = 0;
             return;
         }
 
@@ -34,54 +46,84 @@ namespace inidbi2
         }
 
         static inidbi2 _instance;
-        static string[] stringSeparators = { "|" };
+        static string[] stringSeparators = ["|"];
+        FileIniDataParser parser = new();
 
-        [DllImport("kernel32")]
-        private static extern int WritePrivateProfileString(string section, string key, string val, string filePath);
-        [DllImport("kernel32")]
-        private static extern int GetPrivateProfileString(string section, string key, string def, StringBuilder retVal, int size, string filePath);
-        [DllImport("kernel32")]
-        private static extern int GetPrivateProfileStruct(string section, string key, string struc, int size, string filepath);
-        [DllImport("kernel32")]
-        private static extern int WritePrivateProfileStruct(string section, string key, string struc, int size, string filepath);
-        [DllImport("kernel32")]
-        private static extern int GetPrivateProfileSectionNames(byte[] retVal, int size, string filePath);
-        [DllImport("kernel32")]
-        private static extern int GetPrivateProfileSection(string section, byte[] retVal, int size, string File);
-        [DllImport("kernel32")]
-        private static extern int GetLastError();
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+        private static extern uint GetModuleFileName(IntPtr hModule, StringBuilder lpFilename, uint nSize);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr GetModuleHandle(IntPtr lpModuleName);
+
+        public static string GetDllPath()
+        {
+            StringBuilder path = new StringBuilder(260); // MAX_PATH in Windows
+            IntPtr handle = GetModuleHandle(IntPtr.Zero); // NULL gets the current module
+            GetModuleFileName(handle, path, (uint)path.Capacity);
+            return path.ToString();
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Dl_info
+        {
+            public IntPtr dli_fname;
+            public IntPtr dli_fbase;
+            public IntPtr dli_sname;
+            public IntPtr dli_saddr;
+        }
+
+        [DllImport("libdl.so.2")]
+        private static extern int dladdr(IntPtr addr, ref Dl_info info);
+
+        public static string GetSoPath()
+        {
+            Dl_info info = new Dl_info();
+            dladdr(Addr(), ref info);
+            return Marshal.PtrToStringAnsi(info.dli_fname);
+        }
+
+        public static unsafe IntPtr Addr()
+        {
+            return (IntPtr)(delegate*<IntPtr>)&Addr;
+        }
 
 
-        public string Invoke(string parameters) {
+        public string Invoke(string parameters)
+        {
             string[] lines = parameters.Split(stringSeparators, StringSplitOptions.None);
-            
+
             string function = lines[0];
             string result = "";
 
-            string mypath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) + "\\db\\";
+            string mypath;
+            if (OperatingSystem.IsWindows()) {
+                mypath = Path.Join(Path.GetDirectoryName(GetDllPath()), "db");
+            } else {
+                mypath = Path.Join(Path.GetDirectoryName(GetSoPath()), "db");
+            }
+            //Console.WriteLine($"DB Path: {mypath}");
 
-            switch (function)
-            {
+            switch (function) {
                 case "version":
                     result = this.Version();
                     break;
                 case "write":
-                    result = this.Write(mypath + lines[1], lines[2], lines[3], lines[4]);
+                    result = this.Write(Path.Join(mypath, lines[1]), lines[2], lines[3], lines[4]);
                     break;
                 case "read":
-                    result = this.Read(mypath + lines[1], lines[2], lines[3]);
+                    result = this.Read(Path.Join(mypath, lines[1]), lines[2], lines[3]);
                     break;
                 case "deletesection":
-                    result = this.DeleteSection(mypath + lines[1], lines[2]);
+                    result = this.DeleteSection(Path.Join(mypath, lines[1]), lines[2]);
                     break;
                 case "deletekey":
-                    result = this.DeleteKey(mypath + lines[1], lines[2], lines[3]);
+                    result = this.DeleteKey(Path.Join(mypath, lines[1]), lines[2], lines[3]);
                     break;
                 case "delete":
-                    result = this.Delete(mypath + lines[1]);
+                    result = this.Delete(Path.Join(mypath, lines[1]));
                     break;
                 case "exists":
-                    result = this.Exists(mypath + lines[1]);
+                    result = this.Exists(Path.Join(mypath, lines[1]));
                     break;
                 case "gettimestamp":
                     result = this.GetTimeStamp();
@@ -99,10 +141,10 @@ namespace inidbi2
                     result = GetSeparator();
                     break;
                 case "getsections":
-                    result = GetSections(mypath + lines[1]);
+                    result = GetSections(Path.Join(mypath, lines[1]));
                     break;
                 case "getkeys":
-                    result = GetKeys(mypath + lines[1], lines[2]);
+                    result = GetKeys(Path.Join(mypath, lines[1]), lines[2]);
                     break;
                 default:
                     break;
@@ -130,16 +172,12 @@ namespace inidbi2
         public string Delete(string File)
         {
             string result = "true";
-            try
-            {
-                if (!System.IO.File.Exists(File))
-                {
+            try {
+                if (!System.IO.File.Exists(File)) {
                     throw new Exception("File doesn't exist");
                 }
                 System.IO.File.Delete(File);
-            }
-            catch
-            {
+            } catch {
                 return "false";
             }
             return result;
@@ -147,73 +185,110 @@ namespace inidbi2
 
         public string Exists(string File)
         {
-            return (System.IO.File.Exists(File)).ToString();
+            return System.IO.File.Exists(File).ToString();
         }
 
         public string Write(string File, string Section, string Key, string Value)
         {
-            if(WritePrivateProfileString(Section, Key, Value, File) == 0) {return "false";}else{return "true";}
+            try {
+                IniData data = System.IO.File.Exists(File) ? parser.ReadFile(File) : new IniData();
+                if (!data.Sections.ContainsSection(Section))
+                    data.Sections.AddSection(Section);
+                data[Section][Key] = Value;
+                parser.WriteFile(File, data);
+                return "true";
+            } catch (Exception e) {
+                Console.Error.WriteLine(e.ToString());
+                return "false";
+            }
         }
 
         public string Read(string File, string Section, string Key)
         {
-            StringBuilder temp = new StringBuilder(10230);
-            if(GetPrivateProfileString(Section, Key, "", temp, 10230, File) == 0) { return "[false, \"\"]"; } else { return "[true," + temp + "]"; }
+            try {
+                IniData data = System.IO.File.Exists(File) ? parser.ReadFile(File) : new IniData();
+                if (!data.Sections.ContainsSection(Section) || !data[Section].ContainsKey(Key))
+                    return "[false, \"\"]";
+                var s = data[Section][Key];
+                // This might add compat with old Linux port?
+                if (s.StartsWith('"') && s.EndsWith('"'))
+                    s = s[1..^1];
+                return "[true, " + s + "]";
+            } catch (Exception e) {
+                Console.Error.WriteLine(e.ToString());
+                return "[false, \"\"]";
+            }
         }
 
         public string DeleteSection(string File, string Section)
         {
-            if(WritePrivateProfileStruct(Section, null, null, 0, File) == 0) { return "false"; } else { return "true";}
+            try {
+                IniData data = System.IO.File.Exists(File) ? parser.ReadFile(File) : new IniData();
+                bool ok = data.Sections.RemoveSection(Section);
+                if (ok)
+                    parser.WriteFile(File, data);
+                return ok ? "true" : "false";
+            } catch (Exception e) {
+                Console.Error.WriteLine(e.ToString());
+                return "false";
+            }
         }
 
 
         public string DeleteKey(string File, string Section, string key)
         {
-            if(WritePrivateProfileStruct(Section, key, null, 0, File) == 0) { return "false"; } else { return "true"; }
+            try {
+                IniData data = System.IO.File.Exists(File) ? parser.ReadFile(File) : new IniData();
+                if (!data.Sections.ContainsSection(Section))
+                    return "false";
+                bool ok = data[Section].RemoveKey(Section);
+                if (ok)
+                    parser.WriteFile(File, data);
+                return ok ? "true" : "false";
+            } catch (Exception e) {
+                Console.Error.WriteLine(e.ToString());
+                return "false";
+            }
         }
 
         public string GetSections(string File)
         {
-            byte[] temp = new byte[8000];
-            int s = GetPrivateProfileSectionNames(temp, 8000, File);
-            String result = Encoding.Default.GetString(temp);
-            String[] names = result.Split('\0');
-            result = "[";
-            foreach (String name in names)
-            {
-                if (name != String.Empty)
-                {
-                    result = result + "\"" + name + "\",";
+            try {
+                IniData data = System.IO.File.Exists(File) ? parser.ReadFile(File) : new IniData();
+                StringBuilder sb = new();
+                sb.Append('[');
+                foreach (var sec in data.Sections) {
+                    sb.Append('"');
+                    sb.Append(sec.SectionName);
+                    sb.Append("\",");
                 }
+                sb.Append(']');
+                return sb.ToString();
+            } catch (Exception e) {
+                Console.Error.WriteLine(e.ToString());
+                return "[]";
             }
-            if (result.Length > 1)
-            {
-                result = result.Remove(result.Length - 1, 1);
-            }
-            result = result + "]";
-            return result;
         }
 
         public string GetKeys(string File, string section)
         {
-            byte[] temp = new byte[8000];
-            int s = GetPrivateProfileSection(section, temp, 8000, File);
-            String result = Encoding.Default.GetString(temp);
-            String[] lines = result.Split('\0');
-            result = "[";
-            foreach (String line in lines)
-            {
-                if (line != String.Empty)
-                {
-                    string[] values = line.Split('=');
-                    result = result + "\"" + values[0] + "\",";
+            try {
+                IniData data = System.IO.File.Exists(File) ? parser.ReadFile(File) : new IniData();
+                if (!data.Sections.ContainsSection(section))
+                    return "[]";
+                StringBuilder sb = new();
+                sb.Append('[');
+                foreach (var key in data[section]) {
+                    sb.Append('"');
+                    sb.Append(key.KeyName);
+                    sb.Append("\",");
                 }
+                sb.Append(']');
+                return sb.ToString();
+            } catch (Exception e) {
+                Console.Error.WriteLine(e.ToString());
+                return "[]";
             }
-            if(result.Length > 1 ) {
-                result = result.Remove(result.Length - 1, 1);
-            }
-            result = result + "]";
-            return result;
         }
 
         public string GetTimeStamp()
@@ -225,12 +300,10 @@ namespace inidbi2
         public string EncodeBase64(string plainText)
         {
             string ret = "";
-            try
-            {
-                var plainTextBytes = System.Text.Encoding.UTF8.GetBytes(plainText);
-                ret = System.Convert.ToBase64String(plainTextBytes);
-            } catch
-            {
+            try {
+                var plainTextBytes = Encoding.UTF8.GetBytes(plainText);
+                ret = Convert.ToBase64String(plainTextBytes);
+            } catch {
                 return ret;
             }
             return ret;
@@ -239,12 +312,10 @@ namespace inidbi2
         public string DecodeBase64(string base64EncodedData)
         {
             string ret = "";
-            try
-            {
-                var base64EncodedBytes = System.Convert.FromBase64String(base64EncodedData);
-                ret = System.Text.Encoding.UTF8.GetString(base64EncodedBytes);
-            } catch
-            {
+            try {
+                var base64EncodedBytes = Convert.FromBase64String(base64EncodedData);
+                ret = Encoding.UTF8.GetString(base64EncodedBytes);
+            } catch {
                 return ret;
             }
             return ret;
